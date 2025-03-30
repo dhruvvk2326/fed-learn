@@ -1,4 +1,5 @@
-
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import flwr as fl
 import torch
 import torch.nn as nn
@@ -113,7 +114,7 @@ if __name__ == "__main__":
     num_classes = len(np.unique(y))
     model = IntrusionNet(input_dim, num_classes)
 
-    device = torch.device("cpu")  # Change to "cuda" if GPU is available
+    device = torch.device("cuda")  # Change to "cuda" if GPU is available
     model.to(device)
 
     # fl.client.start_numpy_client(server_address="192.168.1.100:8080",
