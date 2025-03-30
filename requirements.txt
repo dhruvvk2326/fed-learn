@@ -1,0 +1,8 @@
+torch
+torchvision
+flwr
+scikit-learn
+pandas
+numpy
+flask
+docker
