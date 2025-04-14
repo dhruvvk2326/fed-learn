@@ -57,11 +57,12 @@ class NetworkIntrusionClient(fl.client.NumPyClient):
         self.sensitivity = 2.0 if (self.has_both_classes and attack_count > 100) else 0.5
         print(f"Client {client_id} initialized with {len(self.X)} samples, sensitivity={self.sensitivity}")
 
-    def add_noise_to_parameters(self, parameters, round_num):
+    def add_noise_to_parameters(self, parameters, config):
         delta = 1e-5
-        epsilon = self.base_epsilon * (1 + 0.1 * round_num)  # Gradual privacy relaxation
+        round_num = config.get("server_round", 1) 
+        epsilon = self.base_epsilon * (1 + 0.1 * round_num)  # Increasing privacy budget
+    
         noise_scale = np.sqrt(2 * np.log(1.25/delta)) * self.sensitivity / epsilon
-
         noisy_parameters = []
         for param in parameters:
             param_clipped = np.clip(param, -self.sensitivity, self.sensitivity)
@@ -90,7 +91,7 @@ class NetworkIntrusionClient(fl.client.NumPyClient):
                 np.zeros(1, dtype=np.float32)
             ]
 
-        return self.add_noise_to_parameters(parameters, round_num)
+        return self.add_noise_to_parameters(parameters, config)
 
     def set_parameters(self, parameters):
         if isinstance(self.model, LogisticRegression):
