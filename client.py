@@ -1,91 +1,159 @@
-# client.py
 import os
-import numpy as np
 import pandas as pd
+import numpy as np
 import flwr as fl
-import joblib
-from sklearn.preprocessing import RobustScaler
 import argparse
+import joblib
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from sklearn.dummy import DummyClassifier
 
 class NetworkIntrusionClient(fl.client.NumPyClient):
     def __init__(self, client_id):
-        # Load client data
         self.client_id = client_id
-        client_file = f'client_{client_id}.parquet'
-        
-        # Check if file exists
+        client_file = f"client_{client_id}.parquet"
         if not os.path.exists(client_file):
             raise FileNotFoundError(f"Client data not found: {client_file}")
-            
-        # Load data
-        self.df = pd.read_parquet(client_file)
-        
-        # Prepare features and labels
-        self.X = self.df.drop(columns=['Label'])
-        self.y = pd.get_dummies(self.df['Label'])  # One-hot encode labels
-        
-        # Load scaler if available
-        if os.path.exists("robust_scaler.pkl"):
-            self.scaler = joblib.load("robust_scaler.pkl")
-        else:
-            print("Warning: Scaler not found")
-    
-    def get_parameters(self, config):
-        # Get current model parameters
-        # In feature selection case, this would be your feature mask
-        return self.get_feature_mask()
-        
-    def get_feature_mask(self):
-        # If you don't have a stored feature mask, create a default one
-        # This is a placeholder - your actual implementation might use chimp_optimization
-        columns = self.X.columns
-        feature_mask = np.ones(len(columns), dtype=np.int32)
-        return [feature_mask]
-    
-    def fit(self, parameters, config):
-        # Apply received parameters (feature mask)
-        feature_mask = parameters[0]
-        
-        # Get selected features based on mask
-        selected_features = np.where(feature_mask == 1)[0]
-        X_selected = self.X.iloc[:, selected_features]
-        
-        # Your local training here
-        print(f"Client {self.client_id}: Training with {len(selected_features)} features")
-        
-        # Return updated parameters, sample size, and metrics
-        updated_mask = self.run_local_optimization(X_selected)
-        return [updated_mask], len(self.X), {"client_id": self.client_id}
-    
-    
-    def run_local_optimization(self, X):
-    # Handle the case when only one feature is left
-        if X.shape[1] <= 1:
-            mask = np.zeros(len(self.X.columns), dtype=np.int32)
-            # Keep the current feature selected
-            selected_features = np.where(self.X.columns.isin(X.columns))[0]
 
-            if len(selected_features) > 0:
-                mask[selected_features[0]] = 1
-            return mask
-            
-        # Original code for multiple features
-        importance = np.abs(np.corrcoef(X.T))[0]
-        mask = np.zeros(len(self.X.columns), dtype=np.int32)
-        mask[np.argsort(importance)[-int(len(importance)*0.5):]] = 1
-        return mask
+        self.df = pd.read_parquet(client_file)
+        print(f"Client {client_id} original classes: {sorted(self.df['Label'].unique())}")
+        self.df['is_attack'] = np.where(self.df['Label'] == 'Benign', 0, 1)
+
+        attack_count = self.df['is_attack'].sum()
+        benign_count = len(self.df) - attack_count
+        print(f"Client {client_id}: {benign_count} benign, {attack_count} attack samples")
+
+        self.has_both_classes = attack_count > 0 and benign_count > 0
+        if self.has_both_classes:
+            class_weights = {
+                0: 1.0,
+                1: min(benign_count / max(1, attack_count), 10.0)
+            }
+            print(f"Client {client_id} using all {len(self.df)} samples with class weights: {class_weights}")
+
+        self.X = self.df.drop(columns=['Label', 'is_attack']).values
+        self.y = self.df['is_attack'].values
+
+        try:
+            if os.path.exists("robust_scaler_new.pkl"):
+                self.scaler = joblib.load("robust_scaler_new.pkl")
+                self.X = self.scaler.transform(self.X)
+            elif os.path.exists("robust_scaler.pkl"):
+                self.scaler = joblib.load("robust_scaler.pkl")
+                self.X = self.scaler.transform(self.X)
+        except Exception as e:
+            print(f"Client {client_id}: Warning: Could not load/apply scaler: {e}")
+
+        if self.has_both_classes:
+            self.model = LogisticRegression(
+                penalty='l2', C=0.1, solver='liblinear', max_iter=1000,
+                class_weight=class_weights, warm_start=True
+            )
+        else:
+            print(f"Client {client_id} has only one class: {np.unique(self.y)[0]}")
+            self.model = DummyClassifier(strategy="constant", constant=np.unique(self.y)[0])
+
+        self.base_epsilon = 0.5
+        self.sensitivity = 2.0 if (self.has_both_classes and attack_count > 100) else 0.5
+        print(f"Client {client_id} initialized with {len(self.X)} samples, sensitivity={self.sensitivity}")
+
+    def add_noise_to_parameters(self, parameters, round_num):
+        delta = 1e-5
+        epsilon = self.base_epsilon * (1 + 0.1 * round_num)  # Gradual privacy relaxation
+        noise_scale = np.sqrt(2 * np.log(1.25/delta)) * self.sensitivity / epsilon
+
+        noisy_parameters = []
+        for param in parameters:
+            param_clipped = np.clip(param, -self.sensitivity, self.sensitivity)
+            if param.ndim > 1 and self.has_both_classes:
+                coef_magnitude = np.abs(param_clipped)
+                adaptive_scale = 1.0 / (1.0 + coef_magnitude)
+                scaled_noise = np.random.normal(0, noise_scale, param.shape) * adaptive_scale
+                noisy_parameters.append(param_clipped + scaled_noise)
+            else:
+                noise = np.random.normal(0, noise_scale, param.shape)
+                noisy_parameters.append(param_clipped + noise)
+
+        return noisy_parameters
+
+    def get_parameters(self, config):
+        round_num = config.get("server_round", 1)
+        if isinstance(self.model, LogisticRegression) and hasattr(self.model, 'coef_'):
+            parameters = [
+                self.model.coef_.astype(np.float32),
+                self.model.intercept_.astype(np.float32)
+            ]
+        else:
+            n_features = self.X.shape[1]
+            parameters = [
+                np.zeros((1, n_features), dtype=np.float32),
+                np.zeros(1, dtype=np.float32)
+            ]
+
+        return self.add_noise_to_parameters(parameters, round_num)
+
+    def set_parameters(self, parameters):
+        if isinstance(self.model, LogisticRegression):
+            n_features = self.X.shape[1]
+            coef = parameters[0].reshape(1, n_features)
+            intercept = parameters[1].reshape(1)
+            if not hasattr(self.model, 'classes_'):
+                self.model.fit(self.X[:10], np.array([0, 1]*5))
+            self.model.coef_ = coef
+            self.model.intercept_ = intercept
+            self.model.classes_ = np.array([0, 1])
+        elif isinstance(self.model, DummyClassifier) and not hasattr(self.model, 'classes_'):
+            self.model.fit(self.X[:1], self.y[:1])
+
+    def fit(self, parameters, config):
+        self.set_parameters(parameters)
+        try:
+            self.model.fit(self.X, self.y)
+        except Exception as e:
+            print(f"Client {self.client_id} - Fit error: {str(e)}")
+
+        params = self.get_parameters(config)
+        y_pred = self.model.predict(self.X)
+        accuracy = accuracy_score(self.y, y_pred)
+
+        metrics = {"accuracy": float(accuracy), "has_both_classes": int(self.has_both_classes)}
+        if self.has_both_classes:
+            metrics.update({
+                "precision": float(precision_score(self.y, y_pred, zero_division=0)),
+                "recall": float(recall_score(self.y, y_pred, zero_division=0)),
+                "f1": float(f1_score(self.y, y_pred, zero_division=0))
+            })
+
+        print(f"Client {self.client_id} - Training metrics: accuracy={accuracy:.4f}, "
+              f"DP epsilon={self.base_epsilon * (1 + 0.1 * config.get('server_round', 1)):.2f}")
+        return params, len(self.X), metrics
+
+    def evaluate(self, parameters, config):
+        try:
+            self.set_parameters(parameters)
+            y_pred = self.model.predict(self.X)
+            accuracy = accuracy_score(self.y, y_pred)
+            metrics = {"accuracy": float(accuracy)}
+            if self.has_both_classes and len(np.unique(y_pred)) > 1:
+                metrics.update({
+                    "precision": float(precision_score(self.y, y_pred, zero_division=0)),
+                    "recall": float(recall_score(self.y, y_pred, zero_division=0)),
+                    "f1": float(f1_score(self.y, y_pred, zero_division=0)),
+                    "has_both_classes": 1
+                })
+            else:
+                metrics["has_both_classes"] = 0
+            return float(accuracy), len(self.X), metrics
+        except Exception as e:
+            print(f"Client {self.client_id} - Evaluation error: {str(e)}")
+            return 0.0, len(self.X), {"accuracy": 0.0, "has_both_classes": 0}
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Flower client with DP")
     parser.add_argument("--client-id", type=int, default=0)
-    parser.add_argument("--server", type=str, default="127.0.0.1:8080")
     args = parser.parse_args()
-    
-    # Start client
-    fl.client.start_numpy_client(
-        server_address=args.server,
-        client=NetworkIntrusionClient(client_id=args.client_id)
-    )
+    client = NetworkIntrusionClient(client_id=args.client_id)
+    fl.client.start_numpy_client(server_address="127.0.0.1:8080", client=client)
 
 if __name__ == "__main__":
     main()
